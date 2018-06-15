@@ -13,39 +13,31 @@
 package org.eclipse.smarthome.io.net.http;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
+import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
+import java.net.Proxy;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang.StringUtils;
 import org.eclipse.jetty.client.HttpClient;
-import org.eclipse.jetty.client.HttpProxy;
-import org.eclipse.jetty.client.ProxyConfiguration;
-import org.eclipse.jetty.client.ProxyConfiguration.Proxy;
-import org.eclipse.jetty.client.api.Authentication;
-import org.eclipse.jetty.client.api.AuthenticationStore;
-import org.eclipse.jetty.client.api.ContentResponse;
-import org.eclipse.jetty.client.api.Request;
-import org.eclipse.jetty.client.util.BasicAuthentication;
-import org.eclipse.jetty.client.util.InputStreamContentProvider;
-import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpMethod;
 import org.eclipse.jetty.http.HttpStatus;
-import org.eclipse.jetty.util.B64Code;
-import org.eclipse.jetty.util.StringUtil;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.smarthome.core.library.types.RawType;
-import org.osgi.service.component.annotations.Component;
-import org.osgi.service.component.annotations.Reference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,16 +48,11 @@ import org.slf4j.LoggerFactory;
  * @author Kai Kreuzer - Initial contribution and API
  * @author Svilen Valkanov - replaced Apache HttpClient with Jetty
  */
-@Component(immediate = true)
 public class HttpUtil {
 
     private static Logger logger = LoggerFactory.getLogger(HttpUtil.class);
 
     private static final int DEFAULT_TIMEOUT_MS = 5000;
-    private static final String CONSUMER_THREAD_NAME = "HttpUtil";
-
-    private static HttpClientFactory httpClientFactory;
-    private static HttpClient httpClient;
     private static final SslContextFactory SSL_CONTEXT_FACTORY = new SslContextFactory();
 
     private static class ProxyParams {
@@ -74,6 +61,16 @@ public class HttpUtil {
         public String proxyUser = null;
         public String proxyPassword = null;
         public String nonProxyHosts = null;
+    }
+
+    private static class ContentResponse {
+        public String mediaType;
+        public String encoding;
+        public byte[] content;
+        public String contentAsString;
+        public Map<String, List<String>> headerFields;
+        public long contentLength;
+        public int statusCode;
     }
 
     /**
@@ -159,10 +156,10 @@ public class HttpUtil {
             String proxyPassword, String nonProxyHosts) throws IOException {
         ContentResponse response = executeUrlAndGetReponse(httpMethod, url, httpHeaders, content, contentType, timeout,
                 proxyHost, proxyPort, proxyUser, proxyPassword, nonProxyHosts);
-        String encoding = response.getEncoding() != null ? response.getEncoding().replaceAll("\"", "").trim() : "UTF-8";
+        String encoding = response.encoding != null ? response.encoding.replaceAll("\"", "").trim() : "UTF-8";
         String responseBody;
         try {
-            responseBody = new String(response.getContent(), encoding);
+            responseBody = new String(response.content, encoding);
         } catch (UnsupportedEncodingException e) {
             responseBody = null;
         }
@@ -171,8 +168,6 @@ public class HttpUtil {
 
     /**
      * Executes the given <code>url</code> with the given <code>httpMethod</code>.
-     * Synchronize the access to the http client during requests because we sometimes manipulate the client (e.g. add
-     * proxy), as this must not interfere with other request calls.
      *
      * @param httpMethod    the HTTP method to use
      * @param url           the url to execute
@@ -190,88 +185,110 @@ public class HttpUtil {
      * @return the response as a ContentResponse object or <code>NULL</code> when the request went wrong
      * @throws IOException when the request execution failed, timed out or it was interrupted
      */
-    private static synchronized ContentResponse executeUrlAndGetReponse(String httpMethod, String url,
-            Properties httpHeaders, InputStream content, String contentType, int timeout, String proxyHost,
-            Integer proxyPort, String proxyUser, String proxyPassword, String nonProxyHosts) throws IOException {
+    private static ContentResponse executeUrlAndGetReponse(String httpMethod, String url, Properties httpHeaders,
+            InputStream content, String contentType, int timeout, String proxyHost, Integer proxyPort, String proxyUser,
+            String proxyPassword, String nonProxyHosts) throws IOException {
 
-        // Create http client from factory "on-demand"
-        if (HttpUtil.httpClient == null) {
-            // Bundle was not yet activated or has been deactivated - No better way to handle this case gracefully
-            Objects.requireNonNull(httpClientFactory,
-                    "Http client factory was null probably due to bundle not being ACTIVE");
-            HttpUtil.httpClient = httpClientFactory.createHttpClient(CONSUMER_THREAD_NAME, SSL_CONTEXT_FACTORY);
-            httpClientFactory.startHttpClient(httpClient);
-        }
+        final URL urlObject = new URL(url);
 
-        HttpProxy proxy = null;
+        final boolean useProxy = (StringUtils.isNotBlank(proxyHost) && proxyPort != null
+                && shouldUseProxy(url, nonProxyHosts));
         // Only configure a proxy if a host is provided
-        if (StringUtils.isNotBlank(proxyHost) && proxyPort != null && shouldUseProxy(url, nonProxyHosts)) {
-            AuthenticationStore authStore = httpClient.getAuthenticationStore();
-            ProxyConfiguration proxyConfig = httpClient.getProxyConfiguration();
-            List<Proxy> proxies = proxyConfig.getProxies();
+        final Proxy proxy = (useProxy ? new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort))
+                : Proxy.NO_PROXY);
 
-            proxy = new HttpProxy(proxyHost, proxyPort);
-            proxies.add(proxy);
+        final HttpURLConnection con = (HttpURLConnection) urlObject.openConnection(proxy);
 
-            authStore.addAuthentication(
-                    new BasicAuthentication(proxy.getURI(), Authentication.ANY_REALM, proxyUser, proxyPassword));
+        if (useProxy && StringUtils.isNotBlank(proxyUser) && proxyPassword != null) {
+            final String basicProxyAuthentication = Base64.getEncoder()
+                    .encodeToString((proxyUser + ":" + proxyPassword).getBytes(StandardCharsets.UTF_8));
+            con.setRequestProperty("Proxy-Authorization", "Basic " + basicProxyAuthentication);
         }
 
-        final HttpMethod method = HttpUtil.createHttpMethod(httpMethod);
+        // TODO jan.hendriks Check for correct/required settings here
+        con.setRequestMethod(httpMethod);
+        con.setConnectTimeout(timeout);
+        con.setReadTimeout(timeout);
+        con.setDoInput(true);
+        con.setUseCaches(false);
+        con.setInstanceFollowRedirects(true);
 
-        final Request request = httpClient.newRequest(url).method(method).timeout(timeout, TimeUnit.MILLISECONDS);
-
+        // Add additional given headers to request
         if (httpHeaders != null) {
-            for (String httpHeaderKey : httpHeaders.stringPropertyNames()) {
-                request.header(httpHeaderKey, httpHeaders.getProperty(httpHeaderKey));
-            }
+            httpHeaders.stringPropertyNames().forEach(
+                    httpHeaderKey -> con.setRequestProperty(httpHeaderKey, httpHeaders.getProperty(httpHeaderKey)));
         }
 
-        // add basic auth header, if url contains user info
+        // Add basic auth header, if url contains user info
         try {
-            URI uri = new URI(url);
+            final URI uri = new URI(url);
             if (uri.getUserInfo() != null) {
-                String[] userInfo = uri.getUserInfo().split(":");
-
-                String user = userInfo[0];
-                String password = userInfo[1];
-
-                String basicAuthentication = "Basic " + B64Code.encode(user + ":" + password, StringUtil.__ISO_8859_1);
-                request.header(HttpHeader.AUTHORIZATION, basicAuthentication);
+                final String[] userInfo = uri.getUserInfo().split(":");
+                final String user = userInfo[0];
+                final String password = userInfo[1];
+                final String basicAuthentication = Base64.getEncoder()
+                        .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
+                con.setRequestProperty("Authorization", "Basic " + basicAuthentication);
             }
         } catch (URISyntaxException e) {
-            logger.debug("String {} can not be parsed as URI reference", url);
-        }
-
-        // add content if a valid method is given ...
-        if (content != null && (method.equals(HttpMethod.POST) || method.equals(HttpMethod.PUT))) {
-            // Close this outmost stream again after use!
-            try (final InputStreamContentProvider inputStreamContentProvider = new InputStreamContentProvider(
-                    content)) {
-                request.content(inputStreamContentProvider, contentType);
-            }
+            logger.debug("String {} can not be parsed as URI reference", urlObject);
         }
 
         if (logger.isDebugEnabled()) {
-            logger.debug("About to execute {}", request.getURI());
+            logger.debug("About to execute {}", con.getURL());
         }
 
+        // add request content if a valid method is given ...
+        if (content != null && (httpMethod.equals("POST") || httpMethod.equals("PUT"))) {
+            try (final OutputStream connectionRequestBody = con.getOutputStream()) {
+                con.setDoOutput(true);
+                con.setRequestProperty("Content-Type", contentType);
+                copyStream(content, connectionRequestBody);
+                connectionRequestBody.flush();
+            }
+        }
+
+        // Get response
         try {
-            ContentResponse response = request.send();
-            int statusCode = response.getStatus();
-            if (statusCode >= HttpStatus.BAD_REQUEST_400) {
-                String statusLine = statusCode + " " + response.getReason();
+            int statusCode = con.getResponseCode();
+            if (logger.isDebugEnabled() && statusCode >= HttpStatus.BAD_REQUEST_400) {
+                final String statusLine = statusCode + " " + con.getResponseMessage();
                 logger.debug("Method failed: {}", statusLine);
+                // con.getErrorStream() may provide additional
             }
 
-            return response;
+            try (final InputStream responseStream = con.getInputStream();
+                    final ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
+
+                int nRead;
+                byte[] data = new byte[1024];
+                while ((nRead = responseStream.read(data, 0, data.length)) != -1) {
+                    buffer.write(data, 0, nRead);
+                }
+                buffer.flush();
+
+                final ContentResponse contentResponse = new ContentResponse();
+                contentResponse.content = buffer.toByteArray();
+                contentResponse.contentAsString = buffer.toString();
+                contentResponse.contentLength = con.getContentLengthLong();
+                contentResponse.encoding = con.getContentEncoding();
+                contentResponse.headerFields = con.getHeaderFields();
+                contentResponse.mediaType = con.getContentType();
+                contentResponse.statusCode = con.getResponseCode();
+                return contentResponse;
+            }
         } catch (Exception e) {
             throw new IOException(e);
         } finally {
-            if (proxy != null) {
-                // Remove the proxy, that has been added for this request
-                httpClient.getProxyConfiguration().getProxies().remove(proxy);
-            }
+            con.disconnect();
+        }
+    }
+
+    private static void copyStream(final InputStream input, final OutputStream output) throws IOException {
+        byte[] buffer = new byte[1024];
+        int bytesRead;
+        while ((bytesRead = input.read(buffer)) != -1) {
+            output.write(buffer, 0, bytesRead);
         }
     }
 
@@ -455,14 +472,14 @@ public class HttpUtil {
             ContentResponse response = executeUrlAndGetReponse("GET", url, null, null, null, timeout,
                     proxyParams.proxyHost, proxyParams.proxyPort, proxyParams.proxyUser, proxyParams.proxyPassword,
                     proxyParams.nonProxyHosts);
-            byte[] data = response.getContent();
+            byte[] data = response.content;
             long length = (data == null) ? 0 : data.length;
-            String mediaType = response.getMediaType();
+            String mediaType = response.mediaType;
             logger.debug("Media download response: status {} content length {} media type {} (URL {})",
-                    response.getStatus(), length, mediaType, url);
+                    response.statusCode, length, mediaType, url);
 
-            if (response.getStatus() != HttpStatus.OK_200 || length == 0) {
-                logger.debug("Media download failed: unexpected return code {} (URL {})", response.getStatus(), url);
+            if (response.statusCode != HttpStatus.OK_200 || length == 0) {
+                logger.debug("Media download failed: unexpected return code {} (URL {})", response.statusCode, url);
                 return null;
             }
 
@@ -542,26 +559,6 @@ public class HttpUtil {
     private static boolean isJpeg(byte[] data) {
         return (data.length >= 2 && data[0] == (byte) 0xFF && data[1] == (byte) 0xD8
                 && data[data.length - 2] == (byte) 0xFF && data[data.length - 1] == (byte) 0xD9);
-    }
-
-    public static void stopHttpClient() {
-        if (httpClient != null) {
-            if (httpClientFactory != null) {
-                httpClientFactory.stopHttpClient(httpClient);
-            }
-            httpClient = null;
-        }
-    }
-
-    @Reference
-    protected void setHttpClientFactory(final HttpClientFactory httpClientFactory) {
-        HttpUtil.httpClientFactory = httpClientFactory;
-    }
-
-    protected void unsetHttpClientFactory(final HttpClientFactory httpClientFactory) {
-        if (HttpUtil.httpClientFactory == httpClientFactory) {
-            HttpUtil.httpClientFactory = null;
-        }
     }
 
 }
